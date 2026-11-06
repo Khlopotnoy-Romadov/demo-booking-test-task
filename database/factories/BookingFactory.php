@@ -19,8 +19,8 @@ class BookingFactory extends Factory
         return [
             'room_id' => Room::factory(),
             'user_id' => User::factory(),
-            'starts_at' => $startsAt,
-            'ends_at' => $startsAt->copy()->addHour(),
+            'starts_at' => $startsAt->utc(),
+            'ends_at' => $startsAt->copy()->addHour()->utc(),
             'title' => fake()->sentence(3),
         ];
     }

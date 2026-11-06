@@ -2,12 +2,15 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\StoreBookingRequest;
 use App\Models\Booking;
 use App\Models\Room;
-use Carbon\Carbon;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
 
 class BookingController extends Controller
 {
@@ -18,33 +21,64 @@ class BookingController extends Controller
             ->paginate(20);
     }
 
-    public function store(Request $request)
+    /**
+     * Create a booking for the authenticated user.
+     *
+     * The request validation checks the room, the working hours of the office the
+     * room belongs to, the duration and the 15 minute step. The conflict check is
+     * repeated inside a transaction under a per-room advisory lock, so two
+     * simultaneous requests for the same slot cannot both succeed.
+     */
+    public function store(StoreBookingRequest $request): JsonResponse
     {
-        $conflict = DB::select("SELECT id FROM bookings
-            WHERE room_id = {$request->room_id}
-            AND starts_at <= '{$request->ends_at}'
-            AND ends_at >= '{$request->starts_at}'");
+        $room = $request->room();
+        [$startsAt, $endsAt] = $request->validatedInterval();
 
-        if ($conflict) {
-            return response()->json(['error' => 'Комната занята'], 409);
-        }
+        $booking = DB::transaction(function () use ($request, $room, $startsAt, $endsAt): Booking {
+            DB::statement('select pg_advisory_xact_lock(?::bigint)', [$room->id]);
 
-        $start = Carbon::parse($request->starts_at);
-        if ($start->hour < 9 || $start->hour >= 20) {
-            return response()->json(['error' => 'Нерабочее время'], 422);
-        }
+            $isTaken = Booking::query()
+                ->overlapping($room->id, $startsAt, $endsAt)
+                ->exists();
 
-        $booking = Booking::create($request->all());
+            if ($isTaken) {
+                throw ValidationException::withMessages([
+                    'starts_at' => 'Комната занята: на выбранное время уже есть бронь.',
+                ]);
+            }
 
-        Log::withContext(['booking_id' => $booking->id]);
-        Log::channel('bookings')->info('Booking created');
+            $booking = new Booking([
+                'room_id' => $room->id,
+                'starts_at' => $startsAt,
+                'ends_at' => $endsAt,
+                'title' => (string) $request->string('title'),
+            ]);
 
-        return $booking;
+            $booking->user_id = $request->user()->id;
+            $booking->save();
+
+            return $booking;
+        });
+
+        Log::channel('bookings')->info('Booking created', [
+            'booking_id' => $booking->id,
+            'room_id' => $booking->room_id,
+            'user_id' => $booking->user_id,
+            'starts_at' => $booking->starts_at->toIso8601String(),
+            'ends_at' => $booking->ends_at->toIso8601String(),
+        ]);
+
+        return response()->json($booking, 201);
     }
 
-    public function destroy($id)
+    /**
+     * Cancel a booking. Only its author may do it.
+     */
+    public function destroy(Booking $booking): Response
     {
-        Booking::findOrFail($id)->delete();
+        $this->authorize('delete', $booking);
+
+        $booking->delete();
 
         return response()->noContent();
     }
